@@ -275,7 +275,7 @@ async function sendTxWithRetry(
   tx: VersionedTransaction,
   authority: string,
   maxRetries: number = 3
-): Promise<{ success: boolean; isBuffer: boolean }> {
+): Promise<{ success: boolean; isBuffer: boolean; shouldRetryNextCycle: boolean }> {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       const sig = await connection.sendTransaction(tx, {
@@ -293,39 +293,70 @@ async function sendTxWithRetry(
       if (confirmation.value.err) {
         const errStr = JSON.stringify(confirmation.value.err);
         if (errStr.includes('6008') || errStr.includes('BufferPeriod')) {
-          return { success: false, isBuffer: true };
+          return { success: false, isBuffer: true, shouldRetryNextCycle: true };
         }
+        // Log the actual error code for debugging
         console.error(`  ✗ Failed for ${authority}...: ${errStr}`);
-        return { success: false, isBuffer: false };
+        // Most on-chain errors should retry next round
+        return { success: false, isBuffer: false, shouldRetryNextCycle: true };
       }
       
       console.log(`  ✓ Auto-deployed for ${authority}...`);
-      return { success: true, isBuffer: false };
+      return { success: true, isBuffer: false, shouldRetryNextCycle: false };
     } catch (err: any) {
-      const errMsg = err.message || '';
+      // Capture full error details
+      const errMsg = err.message || err.toString() || 'Unknown error';
+      const errLogs = err.logs?.join('\n') || '';
+      const fullError = errLogs ? `${errMsg}\nLogs: ${errLogs}` : errMsg;
       
       // Check if it's a buffer period error
-      if (errMsg.includes('BufferPeriod') || errMsg.includes('6008')) {
+      if (fullError.includes('BufferPeriod') || fullError.includes('6008')) {
         if (attempt < maxRetries - 1) {
           await sleep(2000);
           continue;
         }
-        return { success: false, isBuffer: true };
+        return { success: false, isBuffer: true, shouldRetryNextCycle: true };
+      }
+      
+      // Already deployed this round - not an error
+      if (fullError.includes('AlreadyDeployed') || fullError.includes('6003')) {
+        console.log(`  ✓ Already deployed ${authority}... (skipping)`);
+        return { success: true, isBuffer: false, shouldRetryNextCycle: false };
+      }
+      
+      // Needs checkpoint first - will retry next cycle after checkpoint runs
+      if (fullError.includes('NotCheckpointed') || fullError.includes('6004')) {
+        console.log(`  ⏳ ${authority}... needs checkpoint first`);
+        return { success: false, isBuffer: false, shouldRetryNextCycle: true };
+      }
+      
+      // NoTilesSelected (6003 / 0x1773) - tiles already deployed or tile_config is 0
+      // This means user already deployed this round (likely from a parallel tx that succeeded)
+      if (fullError.includes('NoTilesSelected') || fullError.includes('6003') || fullError.includes('0x1773')) {
+        console.log(`  ✓ ${authority}... already deployed (NoTilesSelected)`);
+        return { success: true, isBuffer: false, shouldRetryNextCycle: false }; // Treat as success
+      }
+      
+      // Insufficient balance in automation - don't retry
+      if (fullError.includes('InsufficientBalance') || fullError.includes('6001')) {
+        console.log(`  ⚠ ${authority}... has insufficient automation balance`);
+        return { success: false, isBuffer: false, shouldRetryNextCycle: false };
       }
       
       // Rate limit - wait and retry
-      if (errMsg.includes('429') || errMsg.includes('rate') || errMsg.includes('Too many')) {
+      if (fullError.includes('429') || fullError.includes('rate') || fullError.includes('Too many')) {
         console.log(`  Rate limited, waiting 1s...`);
         await sleep(1000);
         continue;
       }
       
-      console.error(`  ✗ Failed for ${authority}...: ${errMsg}`);
-      return { success: false, isBuffer: false };
+      // Log detailed error for debugging
+      console.error(`  ✗ Failed for ${authority}...: ${fullError.slice(0, 200)}`);
+      return { success: false, isBuffer: false, shouldRetryNextCycle: true };
     }
   }
   
-  return { success: false, isBuffer: false };
+  return { success: false, isBuffer: false, shouldRetryNextCycle: true };
 }
 
 // Process automations in batches
@@ -508,24 +539,13 @@ async function runAutoDeployCycle(
     deployed += result.deployed;
     errors += result.errors;
     
-    // If we got buffer errors, wait and retry the whole batch once
+    // If we got buffer errors, wait for buffer to end then continue to next batch
+    // Don't retry the same batch - users who failed will be picked up next poll cycle
+    // with fresh eligibility checks
     if (result.bufferErrors > 0) {
-      console.log(`  ${result.bufferErrors} buffer errors, waiting 3s and retrying...`);
+      console.log(`  ${result.bufferErrors} buffer errors - will retry next cycle`);
+      // Wait a bit for buffer to end before processing next batch
       await sleep(3000);
-      
-      const retryResult = await processBatch(
-        program,
-        connection,
-        executor,
-        batch,
-        boardPda,
-        configPda,
-        feeCollector,
-        boardData.roundId
-      );
-      
-      deployed += retryResult.deployed;
-      errors += retryResult.errors + retryResult.bufferErrors;
     }
     
     // Small delay between batches to avoid rate limiting
