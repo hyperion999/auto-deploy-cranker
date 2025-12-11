@@ -4,12 +4,16 @@
  * Railway-compatible service that automatically deploys for users with automation enabled.
  * Executes auto_deploy for all active automation accounts.
  * 
+ * Optimized for Helius RPC with batch processing and priority fees.
+ * 
  * Environment Variables:
- *   SOLANA_RPC_URL    - Solana RPC endpoint (required)
+ *   SOLANA_RPC_URL    - Solana RPC endpoint (required) - use Helius for best performance
  *   PRIVATE_KEY       - Executor wallet private key as JSON array (required)
  *   PROGRAM_ID        - Dark Matter program ID (required)
  *   DRY_RUN           - Set to "1" for dry run mode (optional)
  *   POLL_INTERVAL_MS  - Polling interval in ms (default: 5000)
+ *   BATCH_SIZE        - Number of parallel transactions (default: 10)
+ *   PRIORITY_FEE      - Priority fee in microlamports (default: 50000)
  */
 
 // Polyfill for Node.js < 19 (crypto not globally available)
@@ -23,7 +27,11 @@ import {
   Keypair, 
   PublicKey, 
   SystemProgram,
-  LAMPORTS_PER_SOL
+  LAMPORTS_PER_SOL,
+  TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+  ComputeBudgetProgram
 } from "@solana/web3.js";
 import * as anchor from "@coral-xyz/anchor";
 
@@ -33,6 +41,8 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const PROGRAM_ID_STR = process.env.PROGRAM_ID;
 const DRY_RUN = process.env.DRY_RUN === "1";
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "5000");
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "10");
+const PRIORITY_FEE = parseInt(process.env.PRIORITY_FEE || "50000"); // microlamports
 
 if (!SOLANA_RPC_URL) throw new Error("SOLANA_RPC_URL is required");
 if (!PRIVATE_KEY) throw new Error("PRIVATE_KEY is required");
@@ -149,23 +159,45 @@ async function getAutomationsForExecutor(
   return automations;
 }
 
-async function canDeploy(
+// Batch fetch miner accounts for eligibility check
+async function batchGetMinerAccounts(
   connection: Connection,
+  authorities: PublicKey[]
+): Promise<Map<string, ReturnType<typeof decodeMiner> | null>> {
+  const minerPdas = authorities.map(a => deriveMinerPda(a));
+  const minerInfos = await connection.getMultipleAccountsInfo(minerPdas);
+  
+  const result = new Map<string, ReturnType<typeof decodeMiner> | null>();
+  
+  for (let i = 0; i < authorities.length; i++) {
+    const authority = authorities[i].toBase58();
+    const info = minerInfos[i];
+    if (info) {
+      try {
+        result.set(authority, decodeMiner(info.data as Buffer));
+      } catch {
+        result.set(authority, null);
+      }
+    } else {
+      result.set(authority, null);
+    }
+  }
+  
+  return result;
+}
+
+function canDeployWithMinerData(
   automation: ReturnType<typeof decodeAutomation>,
+  minerData: ReturnType<typeof decodeMiner> | null,
   currentRoundId: number
-): Promise<boolean> {
+): boolean {
   // Check if automation has sufficient balance
   const minRequired = automation.amountPerTile + automation.executorFee + CHECKPOINT_FEE;
   if (automation.balance < minRequired) {
     return false;
   }
   
-  // Check if miner needs checkpoint first
-  const minerPda = deriveMinerPda(automation.authority);
-  const minerInfo = await connection.getAccountInfo(minerPda);
-  
-  if (minerInfo) {
-    const minerData = decodeMiner(minerInfo.data as Buffer);
+  if (minerData) {
     // If miner participated in a previous round and hasn't checkpointed
     const isNeverCheckpointed = minerData.checkpointId > 1e18;
     if (minerData.roundId < currentRoundId && 
@@ -182,7 +214,8 @@ async function canDeploy(
   return true;
 }
 
-async function autoDeploy(
+// Build auto-deploy transaction with priority fee
+async function buildAutoDeployTx(
   program: anchor.Program,
   connection: Connection,
   executor: Keypair,
@@ -191,40 +224,197 @@ async function autoDeploy(
   configPda: PublicKey,
   feeCollector: PublicKey,
   currentRoundId: number
-): Promise<boolean> {
+): Promise<VersionedTransaction> {
   const minerPda = deriveMinerPda(automation.data.authority);
   const roundPda = deriveRoundPda(currentRoundId);
   
+  // Build the auto_deploy instruction
+  const ix = await program.methods
+    .autoDeploy()
+    .accounts({
+      executor: executor.publicKey,
+      authority: automation.data.authority,
+      config: configPda,
+      board: boardPda,
+      round: roundPda,
+      miner: minerPda,
+      automation: automation.pubkey,
+      feeCollector: feeCollector,
+      systemProgram: SystemProgram.programId,
+    })
+    .instruction();
+  
+  // Add priority fee instructions
+  const priorityFeeIx = ComputeBudgetProgram.setComputeUnitPrice({
+    microLamports: PRIORITY_FEE,
+  });
+  
+  const computeUnitsIx = ComputeBudgetProgram.setComputeUnitLimit({
+    units: 200_000, // auto_deploy should need less than this
+  });
+  
+  // Get recent blockhash
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+  
+  // Build versioned transaction
+  const messageV0 = new TransactionMessage({
+    payerKey: executor.publicKey,
+    recentBlockhash: blockhash,
+    instructions: [priorityFeeIx, computeUnitsIx, ix],
+  }).compileToV0Message();
+  
+  const tx = new VersionedTransaction(messageV0);
+  tx.sign([executor]);
+  
+  return tx;
+}
+
+// Send transaction with retry logic
+async function sendTxWithRetry(
+  connection: Connection,
+  tx: VersionedTransaction,
+  authority: string,
+  maxRetries: number = 3
+): Promise<{ success: boolean; isBuffer: boolean }> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const sig = await connection.sendTransaction(tx, {
+        skipPreflight: false,
+        maxRetries: 2,
+      });
+      
+      // Wait for confirmation with timeout
+      const confirmation = await connection.confirmTransaction({
+        signature: sig,
+        blockhash: tx.message.recentBlockhash,
+        lastValidBlockHeight: (await connection.getLatestBlockhash()).lastValidBlockHeight,
+      }, 'confirmed');
+      
+      if (confirmation.value.err) {
+        const errStr = JSON.stringify(confirmation.value.err);
+        if (errStr.includes('6008') || errStr.includes('BufferPeriod')) {
+          return { success: false, isBuffer: true };
+        }
+        console.error(`  ✗ Failed for ${authority}...: ${errStr}`);
+        return { success: false, isBuffer: false };
+      }
+      
+      console.log(`  ✓ Auto-deployed for ${authority}...`);
+      return { success: true, isBuffer: false };
+    } catch (err: any) {
+      const errMsg = err.message || '';
+      
+      // Check if it's a buffer period error
+      if (errMsg.includes('BufferPeriod') || errMsg.includes('6008')) {
+        if (attempt < maxRetries - 1) {
+          await sleep(2000);
+          continue;
+        }
+        return { success: false, isBuffer: true };
+      }
+      
+      // Rate limit - wait and retry
+      if (errMsg.includes('429') || errMsg.includes('rate') || errMsg.includes('Too many')) {
+        console.log(`  Rate limited, waiting 1s...`);
+        await sleep(1000);
+        continue;
+      }
+      
+      console.error(`  ✗ Failed for ${authority}...: ${errMsg}`);
+      return { success: false, isBuffer: false };
+    }
+  }
+  
+  return { success: false, isBuffer: false };
+}
+
+// Process automations in batches
+async function processBatch(
+  program: anchor.Program,
+  connection: Connection,
+  executor: Keypair,
+  automations: { pubkey: PublicKey; data: ReturnType<typeof decodeAutomation> }[],
+  boardPda: PublicKey,
+  configPda: PublicKey,
+  feeCollector: PublicKey,
+  currentRoundId: number
+): Promise<{ deployed: number; errors: number; bufferErrors: number }> {
+  let deployed = 0;
+  let errors = 0;
+  let bufferErrors = 0;
+  
   if (DRY_RUN) {
-    console.log(`  [DRY RUN] Would auto-deploy for ${automation.data.authority.toBase58().slice(0, 8)}...`);
-    console.log(`    Balance: ${automation.data.balance / LAMPORTS_PER_SOL} SOL`);
-    console.log(`    Amount/tile: ${automation.data.amountPerTile / LAMPORTS_PER_SOL} SOL`);
-    console.log(`    Strategy: ${automation.data.strategy === 0 ? 'Random' : 'Preferred'}`);
+    for (const automation of automations) {
+      console.log(`  [DRY RUN] Would auto-deploy for ${automation.data.authority.toBase58().slice(0, 8)}...`);
+    }
+    return { deployed: automations.length, errors: 0, bufferErrors: 0 };
+  }
+  
+  // Build all transactions first
+  const txPromises = automations.map(automation => 
+    buildAutoDeployTx(program, connection, executor, automation, boardPda, configPda, feeCollector, currentRoundId)
+      .then(tx => ({ tx, automation }))
+      .catch(err => {
+        console.error(`  ✗ Failed to build tx for ${automation.data.authority.toBase58().slice(0, 8)}...: ${err.message}`);
+        return null;
+      })
+  );
+  
+  const txResults = await Promise.all(txPromises);
+  const validTxs = txResults.filter((r): r is { tx: VersionedTransaction; automation: typeof automations[0] } => r !== null);
+  
+  // Send all transactions in parallel
+  const sendPromises = validTxs.map(({ tx, automation }) => 
+    sendTxWithRetry(connection, tx, automation.data.authority.toBase58().slice(0, 8))
+  );
+  
+  const results = await Promise.all(sendPromises);
+  
+  for (const result of results) {
+    if (result.success) {
+      deployed++;
+    } else if (result.isBuffer) {
+      bufferErrors++;
+    } else {
+      errors++;
+    }
+  }
+  
+  // Count build failures as errors
+  errors += txResults.filter(r => r === null).length;
+  
+  return { deployed, errors, bufferErrors };
+}
+
+// Wait for buffer period to end
+async function waitForBufferEnd(connection: Connection, boardPda: PublicKey): Promise<boolean> {
+  const boardInfo = await connection.getAccountInfo(boardPda);
+  if (!boardInfo) return false;
+  
+  const boardData = decodeBoard(boardInfo.data as Buffer);
+  const currentSlot = await connection.getSlot();
+  
+  // If waiting for first deploy (round not started)
+  const MAX_U64_APPROX = 1.8e19;
+  if (boardData.endSlot > MAX_U64_APPROX) {
+    return true; // Can deploy to start the round
+  }
+  
+  // If round ended, can't deploy
+  if (currentSlot >= boardData.endSlot) {
+    return false;
+  }
+  
+  // If in buffer period, wait for it to end
+  if (currentSlot < boardData.startSlot) {
+    const slotsToWait = boardData.startSlot - currentSlot;
+    const msToWait = Math.min(slotsToWait * 400, 30000); // Max 30 second wait
+    console.log(`  Waiting ${Math.ceil(msToWait/1000)}s for buffer period to end...`);
+    await sleep(msToWait + 1000); // Add 1 second buffer
     return true;
   }
   
-  try {
-    await program.methods
-      .autoDeploy()
-      .accounts({
-        executor: executor.publicKey,
-        authority: automation.data.authority,
-        config: configPda,
-        board: boardPda,
-        round: roundPda,
-        miner: minerPda,
-        automation: automation.pubkey,
-        feeCollector: feeCollector,
-        systemProgram: SystemProgram.programId,
-      })
-      .rpc();
-    
-    console.log(`  ✓ Auto-deployed for ${automation.data.authority.toBase58().slice(0, 8)}...`);
-    return true;
-  } catch (err: any) {
-    console.error(`  ✗ Failed for ${automation.data.authority.toBase58().slice(0, 8)}...: ${err.message}`);
-    return false;
-  }
+  return true;
 }
 
 async function runAutoDeployCycle(
@@ -252,7 +442,7 @@ async function runAutoDeployCycle(
   if (boardData.endSlot > MAX_U64_APPROX) {
     // Round waiting for first deploy - we can trigger it!
   } else if (currentSlot < boardData.startSlot) {
-    // Still in buffer period
+    // Still in buffer period - silently skip
     return { deployed: 0, skipped: 0, errors: 0 };
   } else if (currentSlot >= boardData.endSlot) {
     // Round ended, wait for reset
@@ -266,10 +456,15 @@ async function runAutoDeployCycle(
     return { deployed: 0, skipped: 0, errors: 0 };
   }
   
+  // Batch fetch all miner accounts for eligibility check
+  const authorities = automations.map(a => a.data.authority);
+  const minerDataMap = await batchGetMinerAccounts(connection, authorities);
+  
   // Filter to automations that can deploy
   const eligibleAutomations = [];
   for (const automation of automations) {
-    if (await canDeploy(connection, automation.data, boardData.roundId)) {
+    const minerData = minerDataMap.get(automation.data.authority.toBase58()) || null;
+    if (canDeployWithMinerData(automation.data, minerData, boardData.roundId)) {
       eligibleAutomations.push(automation);
     } else {
       skipped++;
@@ -282,36 +477,73 @@ async function runAutoDeployCycle(
   
   console.log(`[${new Date().toISOString()}] Round ${boardData.roundId}: ${eligibleAutomations.length} automations ready to deploy`);
   
-  for (const automation of eligibleAutomations) {
-    const success = await autoDeploy(
+  // Wait for buffer period to end before deploying anyone
+  const canProceed = await waitForBufferEnd(connection, boardPda);
+  if (!canProceed) {
+    console.log(`  Round ended while waiting, skipping...`);
+    return { deployed: 0, skipped: eligibleAutomations.length, errors: 0 };
+  }
+  
+  // Process in batches
+  for (let i = 0; i < eligibleAutomations.length; i += BATCH_SIZE) {
+    const batch = eligibleAutomations.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(eligibleAutomations.length / BATCH_SIZE);
+    
+    if (totalBatches > 1) {
+      console.log(`  Processing batch ${batchNum}/${totalBatches} (${batch.length} accounts)...`);
+    }
+    
+    const result = await processBatch(
       program,
       connection,
       executor,
-      automation,
+      batch,
       boardPda,
       configPda,
       feeCollector,
       boardData.roundId
     );
     
-    if (success) {
-      deployed++;
-    } else {
-      errors++;
+    deployed += result.deployed;
+    errors += result.errors;
+    
+    // If we got buffer errors, wait and retry the whole batch once
+    if (result.bufferErrors > 0) {
+      console.log(`  ${result.bufferErrors} buffer errors, waiting 3s and retrying...`);
+      await sleep(3000);
+      
+      const retryResult = await processBatch(
+        program,
+        connection,
+        executor,
+        batch,
+        boardPda,
+        configPda,
+        feeCollector,
+        boardData.roundId
+      );
+      
+      deployed += retryResult.deployed;
+      errors += retryResult.errors + retryResult.bufferErrors;
     }
     
-    await sleep(200); // Rate limiting
+    // Small delay between batches to avoid rate limiting
+    if (i + BATCH_SIZE < eligibleAutomations.length) {
+      await sleep(500);
+    }
   }
   
-  if (deployed > 0) {
-    console.log(`  Summary: ${deployed} deployed, ${skipped} skipped, ${errors} errors`);
-  }
+  console.log(`  Summary: ${deployed} deployed, ${skipped} skipped, ${errors} errors`);
   
   return { deployed, skipped, errors };
 }
 
 async function main() {
-  const connection = new Connection(SOLANA_RPC_URL!, "confirmed");
+  const connection = new Connection(SOLANA_RPC_URL!, {
+    commitment: "confirmed",
+    confirmTransactionInitialTimeout: 60000,
+  });
   const executor = loadKeypair(PRIVATE_KEY!);
   
   const wallet = new anchor.Wallet(executor);
@@ -320,13 +552,15 @@ async function main() {
   });
 
   console.log("============================================================");
-  console.log("DARK MATTER - Auto-Deploy Cranker");
+  console.log("DARK MATTER - Auto-Deploy Cranker (Batch Processing)");
   console.log("============================================================");
   console.log(`Program ID: ${PROGRAM_ID.toBase58()}`);
   console.log(`Executor: ${executor.publicKey.toBase58()}`);
-  console.log(`RPC: ${SOLANA_RPC_URL}`);
+  console.log(`RPC: ${SOLANA_RPC_URL?.includes('helius') ? 'Helius' : SOLANA_RPC_URL?.slice(0, 50)}...`);
   console.log(`Dry run: ${DRY_RUN}`);
   console.log(`Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
+  console.log(`Batch size: ${BATCH_SIZE}`);
+  console.log(`Priority fee: ${PRIORITY_FEE} microlamports`);
   console.log("============================================================\n");
 
   // Derive PDAs
@@ -384,4 +618,3 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-
