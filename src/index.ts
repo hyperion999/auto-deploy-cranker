@@ -295,6 +295,11 @@ async function sendTxWithRetry(
         if (errStr.includes('6008') || errStr.includes('BufferPeriod')) {
           return { success: false, isBuffer: true, shouldRetryNextCycle: true };
         }
+        // NoTilesSelected (6003) means already deployed - treat as success
+        if (errStr.includes('6003')) {
+          console.log(`  ✓ ${authority}... already deployed (NoTilesSelected)`);
+          return { success: true, isBuffer: false, shouldRetryNextCycle: false };
+        }
         // Log the actual error code for debugging
         console.error(`  ✗ Failed for ${authority}...: ${errStr}`);
         // Most on-chain errors should retry next round
@@ -369,16 +374,22 @@ async function processBatch(
   configPda: PublicKey,
   feeCollector: PublicKey,
   currentRoundId: number
-): Promise<{ deployed: number; errors: number; bufferErrors: number }> {
+): Promise<{ 
+  deployed: number; 
+  errors: number; 
+  bufferErrors: number;
+  bufferFailedAutomations: typeof automations;
+}> {
   let deployed = 0;
   let errors = 0;
   let bufferErrors = 0;
+  const bufferFailedAutomations: typeof automations = [];
   
   if (DRY_RUN) {
     for (const automation of automations) {
       console.log(`  [DRY RUN] Would auto-deploy for ${automation.data.authority.toBase58().slice(0, 8)}...`);
     }
-    return { deployed: automations.length, errors: 0, bufferErrors: 0 };
+    return { deployed: automations.length, errors: 0, bufferErrors: 0, bufferFailedAutomations: [] };
   }
   
   // Build all transactions first
@@ -397,15 +408,17 @@ async function processBatch(
   // Send all transactions in parallel
   const sendPromises = validTxs.map(({ tx, automation }) => 
     sendTxWithRetry(connection, tx, automation.data.authority.toBase58().slice(0, 8))
+      .then(result => ({ result, automation }))
   );
   
   const results = await Promise.all(sendPromises);
   
-  for (const result of results) {
+  for (const { result, automation } of results) {
     if (result.success) {
       deployed++;
     } else if (result.isBuffer) {
       bufferErrors++;
+      bufferFailedAutomations.push(automation);
     } else {
       errors++;
     }
@@ -414,7 +427,7 @@ async function processBatch(
   // Count build failures as errors
   errors += txResults.filter(r => r === null).length;
   
-  return { deployed, errors, bufferErrors };
+  return { deployed, errors, bufferErrors, bufferFailedAutomations };
 }
 
 // Wait for buffer period to end
@@ -466,15 +479,21 @@ async function runAutoDeployCycle(
   }
   
   const boardData = decodeBoard(boardInfo.data as Buffer);
-  const currentSlot = await connection.getSlot();
+  let currentSlot = await connection.getSlot();
   
-  // Check if we're in active round (not in buffer period and round started)
+  // Check if we're in active round
   const MAX_U64_APPROX = 1.8e19;
   if (boardData.endSlot > MAX_U64_APPROX) {
     // Round waiting for first deploy - we can trigger it!
   } else if (currentSlot < boardData.startSlot) {
-    // Still in buffer period - silently skip
-    return { deployed: 0, skipped: 0, errors: 0 };
+    // Still in buffer period - wait for it to end instead of skipping
+    const slotsToWait = boardData.startSlot - currentSlot;
+    const msToWait = Math.min(slotsToWait * 400, 15000); // Max 15 second wait
+    if (msToWait > 0) {
+      console.log(`[${new Date().toISOString()}] Buffer period - waiting ${Math.ceil(msToWait/1000)}s for slot ${boardData.startSlot}...`);
+      await sleep(msToWait + 500); // Add 500ms safety margin
+      currentSlot = await connection.getSlot();
+    }
   } else if (currentSlot >= boardData.endSlot) {
     // Round ended, wait for reset
     return { deployed: 0, skipped: 0, errors: 0 };
@@ -508,12 +527,8 @@ async function runAutoDeployCycle(
   
   console.log(`[${new Date().toISOString()}] Round ${boardData.roundId}: ${eligibleAutomations.length} automations ready to deploy`);
   
-  // Wait for buffer period to end before deploying anyone
-  const canProceed = await waitForBufferEnd(connection, boardPda);
-  if (!canProceed) {
-    console.log(`  Round ended while waiting, skipping...`);
-    return { deployed: 0, skipped: eligibleAutomations.length, errors: 0 };
-  }
+  // Collect buffer-failed automations for retry
+  let allBufferFailed: typeof eligibleAutomations = [];
   
   // Process in batches
   for (let i = 0; i < eligibleAutomations.length; i += BATCH_SIZE) {
@@ -539,18 +554,49 @@ async function runAutoDeployCycle(
     deployed += result.deployed;
     errors += result.errors;
     
-    // If we got buffer errors, wait for buffer to end then continue to next batch
-    // Don't retry the same batch - users who failed will be picked up next poll cycle
-    // with fresh eligibility checks
+    // Collect buffer-failed for retry
     if (result.bufferErrors > 0) {
-      console.log(`  ${result.bufferErrors} buffer errors - will retry next cycle`);
-      // Wait a bit for buffer to end before processing next batch
-      await sleep(3000);
+      console.log(`  ${result.bufferErrors} buffer errors - queued for retry`);
+      allBufferFailed = allBufferFailed.concat(result.bufferFailedAutomations);
     }
     
     // Small delay between batches to avoid rate limiting
     if (i + BATCH_SIZE < eligibleAutomations.length) {
       await sleep(500);
+    }
+  }
+  
+  // Retry buffer-failed users after all batches complete
+  if (allBufferFailed.length > 0) {
+    console.log(`  Retrying ${allBufferFailed.length} buffer-failed users...`);
+    
+    // Wait for buffer to definitely end
+    await sleep(3000);
+    
+    // Retry in smaller batches
+    for (let i = 0; i < allBufferFailed.length; i += BATCH_SIZE) {
+      const retryBatch = allBufferFailed.slice(i, i + BATCH_SIZE);
+      
+      const retryResult = await processBatch(
+        program,
+        connection,
+        executor,
+        retryBatch,
+        boardPda,
+        configPda,
+        feeCollector,
+        boardData.roundId
+      );
+      
+      deployed += retryResult.deployed;
+      errors += retryResult.errors;
+      
+      // If still getting buffer errors, they'll be picked up next cycle
+      if (retryResult.bufferErrors > 0) {
+        errors += retryResult.bufferErrors;
+      }
+      
+      await sleep(300);
     }
   }
   
