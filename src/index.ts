@@ -186,6 +186,17 @@ async function batchGetMinerAccounts(
   return result;
 }
 
+// Count number of tiles selected in tile_config bitmap
+function countSelectedTiles(tileConfig: number): number {
+  let count = 0;
+  for (let i = 0; i < NUM_TILES; i++) {
+    if (tileConfig & (1 << i)) {
+      count++;
+    }
+  }
+  return count;
+}
+
 function canDeployWithMinerData(
   automation: ReturnType<typeof decodeAutomation>,
   minerData: ReturnType<typeof decodeMiner> | null,
@@ -274,6 +285,8 @@ async function sendTxWithRetry(
   connection: Connection,
   tx: VersionedTransaction,
   authority: string,
+  amountPerTile: number,
+  numTiles: number,
   maxRetries: number = 3
 ): Promise<{ success: boolean; isBuffer: boolean; shouldRetryNextCycle: boolean }> {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -306,7 +319,8 @@ async function sendTxWithRetry(
         return { success: false, isBuffer: false, shouldRetryNextCycle: true };
       }
       
-      console.log(`  ✓ Auto-deployed for ${authority}...`);
+      const totalSol = (amountPerTile * numTiles) / LAMPORTS_PER_SOL;
+      console.log(`  ✓ Auto-deployed for ${authority}... (${totalSol.toFixed(4)} SOL across ${numTiles} tiles)`);
       return { success: true, isBuffer: false, shouldRetryNextCycle: false };
     } catch (err: any) {
       // Capture full error details
@@ -406,10 +420,16 @@ async function processBatch(
   const validTxs = txResults.filter((r): r is { tx: VersionedTransaction; automation: typeof automations[0] } => r !== null);
   
   // Send all transactions in parallel
-  const sendPromises = validTxs.map(({ tx, automation }) => 
-    sendTxWithRetry(connection, tx, automation.data.authority.toBase58().slice(0, 8))
-      .then(result => ({ result, automation }))
-  );
+  const sendPromises = validTxs.map(({ tx, automation }) => {
+    const numTiles = countSelectedTiles(automation.data.tileConfig);
+    return sendTxWithRetry(
+      connection, 
+      tx, 
+      automation.data.authority.toBase58().slice(0, 8),
+      automation.data.amountPerTile,
+      numTiles
+    ).then(result => ({ result, automation }));
+  });
   
   const results = await Promise.all(sendPromises);
   
